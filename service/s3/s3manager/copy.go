@@ -3,7 +3,6 @@ package s3manager
 import (
 	"context"
 	"fmt"
-	"log"
 	"math"
 	"os"
 	"os/signal"
@@ -342,13 +341,11 @@ func (c copier) copyObject() error {
 	_, err := c.cfg.S3.CopyObject(coi)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			log.Printf(
-				"Failed to get source info for %s: %s\n",
-				c.in.Source, aerr.Error())
+			logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+				"Failed to get source info for %s: %s\n", c.in.Source, aerr.Error()))
 		} else {
-			log.Printf(
-				"Failed to get source info for %s: %s\n",
-				c.in.Source, err)
+			logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+				"Failed to get source info for %s: %s\n", c.in.Source, err))
 		}
 		return err
 	}
@@ -382,11 +379,13 @@ func (c copier) wait() {
 		return
 	case sig := <-sigs:
 		c.cancel()
-		log.Printf("Caught signal %s\n", sig)
+		logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+			"Caught signal %s\n", sig))
 		os.Exit(0)
 	case <-time.After(c.cfg.Timeout):
 		c.cancel()
-		log.Printf("Copy timed out in %s seconds\n", c.cfg.Timeout)
+		logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+			"Copy timed out in %s seconds\n", c.cfg.Timeout))
 		os.Exit(1)
 	}
 }
@@ -420,7 +419,8 @@ func (c copier) copyPart() {
 		for retry := 0; retry <= c.maxRetries; retry++ {
 			resp, err = c.cfg.S3.UploadPartCopy(upci)
 			if err != nil {
-				log.Printf("Error: %s\n Part: %d\n Input %#v\n", err, in.Part, *upci)
+				logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+					"Error: %s\n Part: %d\n Input %#v\n", err, in.Part, *upci))
 				continue
 			}
 			c.results <- copyPartResult{
@@ -448,11 +448,11 @@ func (c copier) complete(uid *string) error {
 	}
 	_, err := c.cfg.S3.CompleteMultipartUpload(cmui)
 	if err != nil {
-		log.Printf("Failed to complete copy for %s: %s\n", *c.in.Source.CopySourceString(), err)
+		logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+			"Failed to complete copy for %s: %s\n", *c.in.Source.CopySourceString(), err))
 		return err
 	}
 	return nil
-
 }
 
 type copyPartResult struct {
@@ -489,13 +489,11 @@ func (c copier) objectInfo(o object) (*s3.HeadObjectOutput, error) {
 	})
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
-			log.Printf(
-				"Failed to get source object info for %s: %s\n",
-				c.in.Source, aerr.Error())
+			logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+				"Failed to get source object info for %s: %s\n", c.in.Source, aerr.Error()))
 		} else {
-			log.Printf(
-				"Failed to get source object info for %s: %s\n",
-				c.in.Source, err)
+			logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+				"Failed to get source object info for %s: %s\n", c.in.Source, err))
 		}
 		return nil, err
 	}
@@ -510,6 +508,7 @@ func (c *copier) deleteObject(o object) {
 	}
 	_, err := c.cfg.SrcS3.DeleteObject(params)
 	if err != nil {
-		log.Printf("Failed to delete %s: %s", o, err)
+		logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+			"Failed to delete %s: %s", o, err))
 	}
 }
