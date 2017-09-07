@@ -20,14 +20,17 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 )
 
-// DefaultCopyPartSize declares the default size of chunks to get copied. It is currently set dumbly to 500MB. So that the maximum object size (5TB) will work without exceeding the maximum part count (10,000).
+// DefaultCopyPartSize declares the default size of chunks to get copied. It is
+// currently set dumbly to 500MB. So that the maximum object size (5TB) will
+// work without exceeding the maximum part count (10,000).
 const DefaultCopyPartSize = 1024 * 1024 * 500
 
 // DefaultCopyConcurrency sets the number of parts to request copying at once.
 const DefaultCopyConcurrency = 64
 
-// DefaultCopyTimeout is the max time we expect the copy operation to take. For a lambda < 5 minutes is best, but for a large copy it could take hours.
-// const DefaultCopyTimeout = 260 * time.Second
+// DefaultCopyTimeout is the max time we expect the copy operation to take. For
+// a lambda < 5 minutes is best, but for a large copy it could take hours. 5TB
+// max file size at 1Gbps ~= 12.5 hours. So with leeway...
 const DefaultCopyTimeout = 18 * time.Hour
 
 type object interface {
@@ -36,6 +39,88 @@ type object interface {
 	CopySourceString() *string
 	String() string
 	Size() int
+}
+
+// CopyInput contains all the input necessary for copy requests to Amazon S3.
+// Please also see https://docs.aws.amazon.com/goto/WebAPI/s3-2006-03-01/UploadPartCopyRequest
+type CopyInput struct {
+	// Bucket is a required field
+	Bucket *string `location:"uri" locationName:"Bucket" type:"string" required:"true"`
+
+	// The name of the source bucket and key name of the source object, separated
+	// by a slash (/). Must be URL-encoded.
+	//
+	// CopySource is a required field
+	CopySource *string `location:"header" locationName:"x-amz-copy-source" type:"string" required:"true"`
+
+	// Copies the object if its entity tag (ETag) matches the specified tag.
+	CopySourceIfMatch *string `location:"header" locationName:"x-amz-copy-source-if-match" type:"string"`
+
+	// Copies the object if it has been modified since the specified time.
+	CopySourceIfModifiedSince *time.Time `location:"header" locationName:"x-amz-copy-source-if-modified-since" type:"timestamp" timestampFormat:"rfc822"`
+
+	// Copies the object if its entity tag (ETag) is different than the specified
+	// ETag.
+	CopySourceIfNoneMatch *string `location:"header" locationName:"x-amz-copy-source-if-none-match" type:"string"`
+
+	// Copies the object if it hasn't been modified since the specified time.
+	CopySourceIfUnmodifiedSince *time.Time `location:"header" locationName:"x-amz-copy-source-if-unmodified-since" type:"timestamp" timestampFormat:"rfc822"`
+
+	// The range of bytes to copy from the source object. The range value must use
+	// the form bytes=first-last, where the first and last are the zero-based byte
+	// offsets to copy. For example, bytes=0-9 indicates that you want to copy the
+	// first ten bytes of the source. You can copy a range only if the source object
+	// is greater than 5 GB.
+	CopySourceRange *string `location:"header" locationName:"x-amz-copy-source-range" type:"string"`
+
+	// Specifies the algorithm to use when decrypting the source object (e.g., AES256).
+	CopySourceSSECustomerAlgorithm *string `location:"header" locationName:"x-amz-copy-source-server-side-encryption-customer-algorithm" type:"string"`
+
+	// Specifies the customer-provided encryption key for Amazon S3 to use to decrypt
+	// the source object. The encryption key provided in this header must be one
+	// that was used when the source object was created.
+	CopySourceSSECustomerKey *string `location:"header" locationName:"x-amz-copy-source-server-side-encryption-customer-key" type:"string"`
+
+	// Specifies the 128-bit MD5 digest of the encryption key according to RFC 1321.
+	// Amazon S3 uses this header for a message integrity check to ensure the encryption
+	// key was transmitted without error.
+	CopySourceSSECustomerKeyMD5 *string `location:"header" locationName:"x-amz-copy-source-server-side-encryption-customer-key-MD5" type:"string"`
+
+	// Key is a required field
+	Key *string `location:"uri" locationName:"Key" min:"1" type:"string" required:"true"`
+
+	// Part number of part being copied. This is a positive integer between 1 and
+	// 10,000.
+	//
+	// PartNumber is a required field
+	PartNumber *int64 `location:"querystring" locationName:"partNumber" type:"integer" required:"true"`
+
+	// Confirms that the requester knows that she or he will be charged for the
+	// request. Bucket owners need not specify this parameter in their requests.
+	// Documentation on downloading objects from requester pays buckets can be found
+	// at http://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html
+	RequestPayer *string `location:"header" locationName:"x-amz-request-payer" type:"string" enum:"RequestPayer"`
+
+	// Specifies the algorithm to use to when encrypting the object (e.g., AES256).
+	SSECustomerAlgorithm *string `location:"header" locationName:"x-amz-server-side-encryption-customer-algorithm" type:"string"`
+
+	// Specifies the customer-provided encryption key for Amazon S3 to use in encrypting
+	// data. This value is used to store the object and then it is discarded; Amazon
+	// does not store the encryption key. The key must be appropriate for use with
+	// the algorithm specified in the x-amz-server-side​-encryption​-customer-algorithm
+	// header. This must be the same encryption key specified in the initiate multipart
+	// upload request.
+	SSECustomerKey *string `location:"header" locationName:"x-amz-server-side-encryption-customer-key" type:"string"`
+
+	// Specifies the 128-bit MD5 digest of the encryption key according to RFC 1321.
+	// Amazon S3 uses this header for a message integrity check to ensure the encryption
+	// key was transmitted without error.
+	SSECustomerKeyMD5 *string `location:"header" locationName:"x-amz-server-side-encryption-customer-key-MD5" type:"string"`
+
+	// Upload ID identifying the multipart upload whose part is being copied.
+	//
+	// UploadId is a required field
+	UploadId *string `location:"querystring" locationName:"uploadId" type:"string" required:"true"`
 }
 
 // CopierInput holds the input paramters for Copier.Copy.
@@ -240,7 +325,7 @@ func (c copier) copy() error {
 	}()
 
 	for i := 0; i < c.cfg.Concurrency; i++ {
-		go c.copyParts()
+		go c.copyPart()
 	}
 	go c.collect()
 	c.wait()
@@ -320,7 +405,7 @@ func (c copier) setErr(e error) {
 	c.err = e
 }
 
-func (c copier) copyParts() {
+func (c copier) copyPart() {
 	var err error
 	var resp *s3.UploadPartCopyOutput
 	for in := range c.work {
