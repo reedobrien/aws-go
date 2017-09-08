@@ -117,8 +117,7 @@ type CopyInput struct {
 	SSECustomerKeyMD5 *string `location:"header" locationName:"x-amz-server-side-encryption-customer-key-MD5" type:"string"`
 
 	// Upload ID identifying the multipart upload whose part is being copied.
-	//
-	// UploadId is a required field
+	// UploadId is a required field.
 	UploadId *string `location:"querystring" locationName:"uploadId" type:"string" required:"true"`
 }
 
@@ -142,6 +141,9 @@ type Copier struct {
 	// How many parts to copy at once.
 	Concurrency int
 
+	// TODO(ro) 2017-09-07 LeavePartsOnError and abort method.
+	// LeavePartsOnError bool
+
 	// The s3 client ot use when copying.
 	S3 s3iface.S3API
 
@@ -161,6 +163,18 @@ func WithCopierRequestOptions(opts ...request.Option) func(*Copier) {
 
 // NewCopier creates a new Copier instance to copy opbjects concurrently from
 // one s3 location to another.
+//
+// Example:
+//	// The session the Copier will use.
+// 	sess := session.Must(session.NewSession())
+//
+// 	// Create a Copier with the session and default options.
+// 	copier := s3.manager.NewCopier(sess)
+//
+// 	// Create a Copier with the session and custom options.
+// 	copier := s3.manager.NewCopier(sess, func(c *s3manager.Copier) {
+//		c.PartSize := 1024 * 1024 * 64  // 64MB parts
+// 	})
 func NewCopier(cfgp client.ConfigProvider, options ...func(*Copier)) *Copier {
 
 	c := &Copier{
@@ -176,7 +190,23 @@ func NewCopier(cfgp client.ConfigProvider, options ...func(*Copier)) *Copier {
 	return c
 }
 
-// NewCopierWithClient returns a Copier using the provided s3API client.
+// NewCopierWithClient returns a Copier using the provided s3API client. Pass
+// in additional functional options to customize the copier's behavior.
+//
+// Example:
+// 	// The session the client will use.
+// 	sess := session.Must(session.NewSession())
+//
+// 	// The client to pass to the Copier.
+// 	svc := s3.New(sess)
+//
+// 	// Create a Copier with the client and default options.
+// 	copier := s3manager.NewCopierWithClient(svc)
+//
+// 	// Create a Copier with the client and custom options.
+// 	copier := s3manager.NewCopierWithClient(svc, func (c *Copier){
+// 		c.PartSize = 1024 * 1024 * 64 // 64MB parts
+// 	})
 func NewCopierWithClient(svc s3iface.S3API, options ...func(*Copier)) *Copier {
 	c := &Copier{
 		S3:          svc,
@@ -189,47 +219,74 @@ func NewCopierWithClient(svc s3iface.S3API, options ...func(*Copier)) *Copier {
 	return c
 }
 
-// Copy copies the source object to the tagret object.
-func (c Copier) Copy(i CopierInput) error {
-	if i.SrcRegion != nil && *i.SrcRegion != "" {
-		srcSess := session.Must(session.NewSession(
-			&aws.Config{Region: i.SrcRegion}))
-		c.SrcS3 = s3.New(srcSess)
-	} else {
-		c.SrcS3 = c.S3
-	}
-
-	return c.CopyWithContext(context.Background(), i)
+// Copy copies the source object to the target object. It attemps to
+// intelligently perform the copy in parallel for large files. The part size
+// and concurrency are configurable through the Copier's parameters by passing
+// functional options to the NewCopier functions.
+//
+// Additional functional options can be provided to the Upload Method to
+// configure options for an individual upload. These options are set on a copy
+// of the Uploader instance. Therefore, modifying options for an individaul
+// copy will not impact the underlying Uploader instance configuration.
+//
+// Use the WithCopierRequestOptions helper function to pass in that will be
+// applied to all API operations made with this uploader.
+//
+// It is safe to call this method concurrently from multiple goroutines.
+//
+// Example:
+// 	// Copy input parameters
+// 	p := &s3manager.CopyInput{
+// 		}
+//
+// 	// Copy the file
+// 	err := copier.Copy(p)
+//
+// 	// Copy with different options.
+// 	err := copier.Copy(p, func(c *s3manager.Copier) {
+// 		c.PartSize = 1024 * 1024 * 10 // 10MB parts.
+//		c.Concurrency = 32 // copy 32 parts concurrently
+// 		})
+func (c Copier) Copy(i CopierInput, options ...func(*Copier)) error {
+	return c.CopyWithContext(context.Background(), i, options...)
 }
 
 // CopyWithContext performs Copy with the provided context.Context.
 func (c Copier) CopyWithContext(ctx aws.Context, input CopierInput, options ...func(*Copier)) error {
+	// TODO(ro) 2017-09-07 should cancel be external?
 	ctx, cancel := context.WithCancel(ctx)
 	impl := copier{in: input, cfg: c, ctx: ctx, cancel: cancel, wg: &sync.WaitGroup{}}
 
+	// Set up a source region. This is to get the source size if it isn't
+	// explicitly provided and for deleting the original source if the option
+	// is set.
+	if impl.in.SrcRegion != nil && *impl.in.SrcRegion != "" {
+		srcSess := session.Must(session.NewSession(
+			&aws.Config{Region: impl.in.SrcRegion}))
+		impl.cfg.SrcS3 = s3.New(srcSess)
+	} else {
+		impl.cfg.SrcS3 = impl.cfg.S3
+	}
+
+	// Apply functional options to the copy of the config.
 	for _, option := range options {
 		option(&impl.cfg)
 	}
+
 	impl.cfg.RequestOptions = append(impl.cfg.RequestOptions, request.WithAppendUserAgent("S3Manager"))
 
 	if s, ok := c.S3.(maxRetrier); ok {
 		impl.maxRetries = s.MaxRetries()
 	}
 
-	if impl.cfg.Concurrency == 0 {
-		impl.cfg.Concurrency = DefaultCopyConcurrency
-	}
-	if impl.cfg.PartSize == 0 {
-		impl.cfg.PartSize = DefaultCopyPartSize
-	}
-
 	return impl.copy()
 }
 
 type copier struct {
-	ctx    aws.Context
-	cancel context.CancelFunc
-	cfg    Copier
+	ctx           aws.Context
+	cancel        context.CancelFunc
+	cfg           Copier
+	contentLength int64
 
 	in      CopierInput
 	parts   []*s3.CompletedPart
@@ -244,7 +301,7 @@ type copier struct {
 	maxRetries int
 }
 
-func (c copier) getContentLength() (int64, error) {
+func (c copier) getContentLength() error {
 	var size int64
 	size = int64(c.in.Source.Size())
 	// If less than 1 we want to double check, because unset == 0. We can make
@@ -252,18 +309,39 @@ func (c copier) getContentLength() (int64, error) {
 	if size <= 0 {
 		info, err := c.objectInfo(c.in.Source)
 		if err != nil {
-			return -1, err
+			return err
 		}
 		size = *info.ContentLength
 	}
-
-	return size, nil
+	c.contentLength = size
+	return nil
 }
-func (c copier) copy() error {
-	contentLength, err := c.getContentLength()
-	if err != nil {
-		return err
+
+// init sets default options if they are 0.
+func (c copier) init() error {
+	if c.cfg.Concurrency == 0 {
+		c.cfg.Concurrency = DefaultCopyConcurrency
 	}
+	if c.cfg.PartSize == 0 {
+		c.cfg.PartSize = DefaultCopyPartSize
+	}
+
+	if c.cfg.PartSize < MinUploadPartSize {
+		msg := fmt.Sprintf("part size must be at least %d bytes", MinUploadPartSize)
+		return awserr.New("ConfigError", msg, nil)
+	}
+
+	err := c.getContentLength()
+	if err != nil {
+		msg := fmt.Sprintf("failed to get content length: %s", err.Error())
+		return awserr.New("RequestError", msg, nil)
+	}
+	return nil
+}
+
+// copy is the internal implementation of Copy.
+func (c copier) copy() error {
+	err := c.init()
 
 	// If there's a request to delete the source copy, do it on exit if there
 	// was no error copying.
@@ -276,9 +354,8 @@ func (c copier) copy() error {
 		}()
 	}
 
-	// fmt.Printf("Got info %#v\n", *info)
 	// If smaller than part size, just copy.
-	if contentLength < c.cfg.PartSize {
+	if c.contentLength < c.cfg.PartSize {
 		return c.copyObject()
 
 	}
@@ -288,20 +365,21 @@ func (c copier) copy() error {
 	if err != nil {
 		return err
 	}
-	// fmt.Printf("Started MultipartUpload %s\n", *uid)
+	logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+		"Started MultipartUpload %s\n", *uid))
 
-	partCount := int(math.Ceil(float64(contentLength) / float64(c.cfg.PartSize)))
+	partCount := int(math.Ceil(float64(c.contentLength) / float64(c.cfg.PartSize)))
 	c.parts = make([]*s3.CompletedPart, partCount)
 	c.results = make(chan copyPartResult, c.cfg.Concurrency)
 	c.work = make(chan multipartCopyInput, c.cfg.Concurrency)
 	var partNum int64
-	size := contentLength
+	size := c.contentLength
 	go func() {
 		for size >= 0 {
 			offset := c.cfg.PartSize * partNum
 			endByte := offset + c.cfg.PartSize - 1
-			if endByte >= contentLength {
-				endByte = contentLength - 1
+			if endByte >= c.contentLength {
+				endByte = c.contentLength - 1
 			}
 			mci := multipartCopyInput{
 				Part:            partNum + 1,
@@ -352,8 +430,10 @@ func (c copier) copyObject() error {
 	return nil
 
 }
+
+// collect adds the completed parts to the parts array at the appropriate
+// index.
 func (c copier) collect() {
-	// fmt.Println("collecting")
 	for r := range c.results {
 		c.parts[r.Part-1] = &s3.CompletedPart{
 			ETag:       r.CopyPartResult.ETag,
@@ -361,6 +441,8 @@ func (c copier) collect() {
 	}
 }
 
+// wait prevents the call from completing until work in the goroutines is
+// finished, we timeout, or a signal is caught.
 func (c copier) wait() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
@@ -385,7 +467,7 @@ func (c copier) wait() {
 	case <-time.After(c.cfg.Timeout):
 		c.cancel()
 		logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
-			"Copy timed out in %s seconds\n", c.cfg.Timeout))
+			"Copy timed out in %s\n", c.cfg.Timeout))
 		os.Exit(1)
 	}
 }
@@ -436,8 +518,8 @@ func (c copier) copyPart() {
 	return
 }
 
+// complete finishes this multipart copy.
 func (c copier) complete(uid *string) error {
-	// fmt.Println("finishing")
 	cmui := &s3.CompleteMultipartUploadInput{
 		Bucket:   c.in.Dest.Bucket(),
 		Key:      c.in.Dest.Key(),
