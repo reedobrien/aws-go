@@ -27,24 +27,37 @@ const DefaultCopyPartSize = 1024 * 1024 * 500
 // DefaultCopyConcurrency sets the number of parts to request copying at once.
 const DefaultCopyConcurrency = 64
 
+// TODO(ro) 2017-09-16 delete?
 // DefaultCopyTimeout is the max time we expect the copy operation to take. For
 // a lambda < 5 minutes is best, but for a large copy it could take hours. 5TB
 // max file size at 1Gbps ~= 12.5 hours. So with leeway...
 const DefaultCopyTimeout = 18 * time.Hour
 
-type object interface {
-	Bucket() *string
-	Key() *string
-	CopySourceString() *string
-	String() string
-	Size() int
-}
-
 // CopyInput contains all the input necessary for copy requests to Amazon S3.
-// Please also see https://docs.aws.amazon.com/goto/WebAPI/s3-2006-03-01/UploadPartCopyRequest
-type CopyInput struct {
+// Please also see https://docs.aws.amazon.com/goto/WebAPI/s3-2006-03-01/CopyObjectRequest
+type Copy2Input struct {
+	// The canned ACL to apply to the object.
+	ACL *string `location:"header" locationName:"x-amz-acl" type:"string" enum:"ObjectCannedACL"`
+
 	// Bucket is a required field
 	Bucket *string `location:"uri" locationName:"Bucket" type:"string" required:"true"`
+
+	// Specifies caching behavior along the request/reply chain.
+	CacheControl *string `location:"header" locationName:"Cache-Control" type:"string"`
+
+	// Specifies presentational information for the object.
+	ContentDisposition *string `location:"header" locationName:"Content-Disposition" type:"string"`
+
+	// Specifies what content encodings have been applied to the object and thus
+	// what decoding mechanisms must be applied to obtain the media-type referenced
+	// by the Content-Type header field.
+	ContentEncoding *string `location:"header" locationName:"Content-Encoding" type:"string"`
+
+	// The language the content is in.
+	ContentLanguage *string `location:"header" locationName:"Content-Language" type:"string"`
+
+	// A standard MIME type describing the format of the object data.
+	ContentType *string `location:"header" locationName:"Content-Type" type:"string"`
 
 	// The name of the source bucket and key name of the source object, separated
 	// by a slash (/). Must be URL-encoded.
@@ -65,13 +78,6 @@ type CopyInput struct {
 	// Copies the object if it hasn't been modified since the specified time.
 	CopySourceIfUnmodifiedSince *time.Time `location:"header" locationName:"x-amz-copy-source-if-unmodified-since" type:"timestamp" timestampFormat:"rfc822"`
 
-	// The range of bytes to copy from the source object. The range value must use
-	// the form bytes=first-last, where the first and last are the zero-based byte
-	// offsets to copy. For example, bytes=0-9 indicates that you want to copy the
-	// first ten bytes of the source. You can copy a range only if the source object
-	// is greater than 5 GB.
-	CopySourceRange *string `location:"header" locationName:"x-amz-copy-source-range" type:"string"`
-
 	// Specifies the algorithm to use when decrypting the source object (e.g., AES256).
 	CopySourceSSECustomerAlgorithm *string `location:"header" locationName:"x-amz-copy-source-server-side-encryption-customer-algorithm" type:"string"`
 
@@ -85,14 +91,30 @@ type CopyInput struct {
 	// key was transmitted without error.
 	CopySourceSSECustomerKeyMD5 *string `location:"header" locationName:"x-amz-copy-source-server-side-encryption-customer-key-MD5" type:"string"`
 
+	// The date and time at which the object is no longer cacheable.
+	Expires *time.Time `location:"header" locationName:"Expires" type:"timestamp" timestampFormat:"rfc822"`
+
+	// Gives the grantee READ, READ_ACP, and WRITE_ACP permissions on the object.
+	GrantFullControl *string `location:"header" locationName:"x-amz-grant-full-control" type:"string"`
+
+	// Allows grantee to read the object data and its metadata.
+	GrantRead *string `location:"header" locationName:"x-amz-grant-read" type:"string"`
+
+	// Allows grantee to read the object ACL.
+	GrantReadACP *string `location:"header" locationName:"x-amz-grant-read-acp" type:"string"`
+
+	// Allows grantee to write the ACL for the applicable object.
+	GrantWriteACP *string `location:"header" locationName:"x-amz-grant-write-acp" type:"string"`
+
 	// Key is a required field
 	Key *string `location:"uri" locationName:"Key" min:"1" type:"string" required:"true"`
 
-	// Part number of part being copied. This is a positive integer between 1 and
-	// 10,000.
-	//
-	// PartNumber is a required field
-	PartNumber *int64 `location:"querystring" locationName:"partNumber" type:"integer" required:"true"`
+	// A map of metadata to store with the object in S3.
+	Metadata map[string]*string `location:"headers" locationName:"x-amz-meta-" type:"map"`
+
+	// Specifies whether the metadata is copied from the source object or replaced
+	// with metadata provided in the request.
+	MetadataDirective *string `location:"header" locationName:"x-amz-metadata-directive" type:"string" enum:"MetadataDirective"`
 
 	// Confirms that the requester knows that she or he will be charged for the
 	// request. Bucket owners need not specify this parameter in their requests.
@@ -107,8 +129,7 @@ type CopyInput struct {
 	// data. This value is used to store the object and then it is discarded; Amazon
 	// does not store the encryption key. The key must be appropriate for use with
 	// the algorithm specified in the x-amz-server-side​-encryption​-customer-algorithm
-	// header. This must be the same encryption key specified in the initiate multipart
-	// upload request.
+	// header.
 	SSECustomerKey *string `location:"header" locationName:"x-amz-server-side-encryption-customer-key" type:"string"`
 
 	// Specifies the 128-bit MD5 digest of the encryption key according to RFC 1321.
@@ -116,15 +137,49 @@ type CopyInput struct {
 	// key was transmitted without error.
 	SSECustomerKeyMD5 *string `location:"header" locationName:"x-amz-server-side-encryption-customer-key-MD5" type:"string"`
 
-	// Upload ID identifying the multipart upload whose part is being copied.
-	// UploadId is a required field.
-	UploadId *string `location:"querystring" locationName:"uploadId" type:"string" required:"true"`
+	// Specifies the AWS KMS key ID to use for object encryption. All GET and PUT
+	// requests for an object protected by AWS KMS will fail if not made via SSL
+	// or using SigV4. Documentation on configuring any of the officially supported
+	// AWS SDKs and CLI can be found at http://docs.aws.amazon.com/AmazonS3/latest/dev/UsingAWSSDK.html#specify-signature-version
+	SSEKMSKeyId *string `location:"header" locationName:"x-amz-server-side-encryption-aws-kms-key-id" type:"string"`
+
+	// The Server-side encryption algorithm used when storing this object in S3
+	// (e.g., AES256, aws:kms).
+	ServerSideEncryption *string `location:"header" locationName:"x-amz-server-side-encryption" type:"string" enum:"ServerSideEncryption"`
+
+	// The type of storage to use for the object. Defaults to 'STANDARD'.
+	StorageClass *string `location:"header" locationName:"x-amz-storage-class" type:"string" enum:"StorageClass"`
+
+	// The tag-set for the object destination object this value must be used in
+	// conjunction with the TaggingDirective. The tag-set must be encoded as URL
+	// Query parameters
+	Tagging *string `location:"header" locationName:"x-amz-tagging" type:"string"`
+
+	// Specifies whether the object tag-set are copied from the source object or
+	// replaced with tag-set provided in the request.
+	TaggingDirective *string `location:"header" locationName:"x-amz-tagging-directive" type:"string" enum:"TaggingDirective"`
+
+	// If the bucket is configured as a website, redirects requests for this object
+	// to another object in the same bucket or to an external URL. Amazon S3 stores
+	// the value of this header in the object metadata.
+	WebsiteRedirectLocation *string `location:"header" locationName:"x-amz-website-redirect-location" type:"string"`
 }
 
-// CopierInput holds the input paramters for Copier.Copy.
-type CopierInput struct {
-	Source    object
-	Dest      object
+// TODO(ro) 2017-09-16 delete
+type object interface {
+	Bucket() *string
+	Key() *string
+	CopySourceString() *string
+	String() string
+	Size() int
+}
+
+// TODO(ro) 2017-09-17 delete?
+// CopyInput holds the input paramters for Copier.Copy.
+type CopyInput struct {
+	Source object
+	Dest   object
+
 	Delete    bool
 	SrcRegion *string
 	Region    *string
@@ -132,6 +187,9 @@ type CopierInput struct {
 
 // Copier holds the configuration details for copying from an s3 object to another s3 location.
 type Copier struct {
+	// ConfigProvider is the config to create sessions from.
+	ConfigProvider client.ConfigProvider
+
 	// The chunk size for parts.
 	PartSize int64
 
@@ -147,7 +205,8 @@ type Copier struct {
 	// The s3 client ot use when copying.
 	S3 s3iface.S3API
 
-	// SrcS3 is the source if set, it is a second region. Needed to delete.
+	// SrcS3 is the source if set, it is a second region. Needed to delete or
+	// get the content length of the source object if not provided.
 	SrcS3 s3iface.S3API
 
 	// RequestOptions to be passed to the individual calls.
@@ -178,10 +237,11 @@ func WithCopierRequestOptions(opts ...request.Option) func(*Copier) {
 func NewCopier(cfgp client.ConfigProvider, options ...func(*Copier)) *Copier {
 
 	c := &Copier{
-		PartSize:    DefaultCopyPartSize,
-		Timeout:     DefaultCopyTimeout,
-		S3:          s3.New(cfgp),
-		Concurrency: DefaultCopyConcurrency,
+		ConfigProvider: cfgp,
+		PartSize:       DefaultCopyPartSize,
+		Timeout:        DefaultCopyTimeout,
+		S3:             s3.New(cfgp),
+		Concurrency:    DefaultCopyConcurrency,
 	}
 	for _, option := range options {
 		option(c)
@@ -247,26 +307,29 @@ func NewCopierWithClient(svc s3iface.S3API, options ...func(*Copier)) *Copier {
 // 		c.PartSize = 1024 * 1024 * 10 // 10MB parts.
 //		c.Concurrency = 32 // copy 32 parts concurrently
 // 		})
-func (c Copier) Copy(i CopierInput, options ...func(*Copier)) error {
+func (c Copier) Copy(i CopyInput, options ...func(*Copier)) error {
 	return c.CopyWithContext(context.Background(), i, options...)
 }
 
 // CopyWithContext performs Copy with the provided context.Context.
-func (c Copier) CopyWithContext(ctx aws.Context, input CopierInput, options ...func(*Copier)) error {
+//
+// CopyWithContext is the same as Copy with additional support for Context
+// input parameters. The Context MUST NOT be nil. passing a nil Context will
+// panic. Use the context to add deadlines, cancelation, etc...
+//
+// Additional functional options can be provided to the Upload Method to
+// configure options for an individual upload. These options are set on a copy
+// of the Uploader instance. Therefore, modifying options for an individaul
+// copy will not impact the underlying Uploader instance configuration.
+//
+// Use the WithCopierRequestOptions helper function to pass in that will be
+// applied to all API operations made with this uploader.
+//
+// It is safe to call this method concurrently from multiple goroutines.
+func (c Copier) CopyWithContext(ctx aws.Context, input CopyInput, options ...func(*Copier)) error {
 	// TODO(ro) 2017-09-07 should cancel be external?
 	ctx, cancel := context.WithCancel(ctx)
 	impl := copier{in: input, cfg: c, ctx: ctx, cancel: cancel, wg: &sync.WaitGroup{}}
-
-	// Set up a source region. This is to get the source size if it isn't
-	// explicitly provided and for deleting the original source if the option
-	// is set.
-	if impl.in.SrcRegion != nil && *impl.in.SrcRegion != "" {
-		srcSess := session.Must(session.NewSession(
-			&aws.Config{Region: impl.in.SrcRegion}))
-		impl.cfg.SrcS3 = s3.New(srcSess)
-	} else {
-		impl.cfg.SrcS3 = impl.cfg.S3
-	}
 
 	// Apply functional options to the copy of the config.
 	for _, option := range options {
@@ -282,13 +345,14 @@ func (c Copier) CopyWithContext(ctx aws.Context, input CopierInput, options ...f
 	return impl.copy()
 }
 
+// copier is the internal implementation of Copier.
 type copier struct {
 	ctx           aws.Context
 	cancel        context.CancelFunc
 	cfg           Copier
 	contentLength int64
 
-	in      CopierInput
+	in      CopyInput
 	parts   []*s3.CompletedPart
 	results chan copyPartResult
 	work    chan multipartCopyInput
@@ -329,6 +393,17 @@ func (c copier) init() error {
 	if c.cfg.PartSize < MinUploadPartSize {
 		msg := fmt.Sprintf("part size must be at least %d bytes", MinUploadPartSize)
 		return awserr.New("ConfigError", msg, nil)
+	}
+
+	// Set up a source region. This is to get the source size if it isn't
+	// explicitly provided and for deleting the original source if the option
+	// is set.
+	if c.in.SrcRegion != nil && *c.in.SrcRegion != "" {
+		srcSess := session.Must(session.NewSession(
+			&aws.Config{Region: c.in.SrcRegion}))
+		c.cfg.SrcS2 = s3.New(srcSess)
+	} else {
+		c.cfg.SrcS2 = c.cfg.S3
 	}
 
 	err := c.getContentLength()
@@ -445,17 +520,15 @@ func (c copier) collect() {
 // finished, we timeout, or a signal is caught.
 func (c copier) wait() {
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() {
-		// fmt.Println("waiting")
+		// Wait until all the results are in, then close the channel.
 		c.wg.Wait()
 		close(c.results)
 		done <- struct{}{}
 	}()
 
-	// TODO(ro) 2017-07-20 make an abort method and call
-	// it here when we exit early.
 	select {
 	case <-done:
 		return
@@ -593,4 +666,12 @@ func (c *copier) deleteObject(o object) {
 		logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
 			"Failed to delete %s: %s", o, err))
 	}
+}
+
+func (c *copier) getBucketLocation(bucket string) (string, error) {
+	region, err := s3manager.GetBucketRegion(c.ctx, sess, bucket, "us-west-2")
+	if err != nil {
+		return "", err
+	}
+	return region, nil
 }
