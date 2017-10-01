@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,15 +28,15 @@ const DefaultCopyPartSize = 1024 * 1024 * 500
 // DefaultCopyConcurrency sets the number of parts to request copying at once.
 const DefaultCopyConcurrency = 64
 
-// TODO(ro) 2017-09-16 delete?
 // DefaultCopyTimeout is the max time we expect the copy operation to take. For
 // a lambda < 5 minutes is best, but for a large copy it could take hours. 5TB
 // max file size at 1Gbps ~= 12.5 hours. So with leeway...
+// TODO(ro) 2017-09-16 delete?
 const DefaultCopyTimeout = 18 * time.Hour
 
-// CopyInput contains all the input necessary for copy requests to Amazon S3.
+// CopyObjectInput contains all the input necessary for copy requests to Amazon S3.
 // Please also see https://docs.aws.amazon.com/goto/WebAPI/s3-2006-03-01/CopyObjectRequest
-type Copy2Input struct {
+type CopyObjectInput struct {
 	// The canned ACL to apply to the object.
 	ACL *string `location:"header" locationName:"x-amz-acl" type:"string" enum:"ObjectCannedACL"`
 
@@ -165,20 +166,11 @@ type Copy2Input struct {
 	WebsiteRedirectLocation *string `location:"header" locationName:"x-amz-website-redirect-location" type:"string"`
 }
 
-// TODO(ro) 2017-09-16 delete
-type object interface {
-	Bucket() *string
-	Key() *string
-	CopySourceString() *string
-	String() string
-	Size() int
-}
-
-// TODO(ro) 2017-09-17 delete?
 // CopyInput holds the input paramters for Copier.Copy.
 type CopyInput struct {
-	Source object
-	Dest   object
+	*CopyObjectInput
+
+	Size int
 
 	Delete    bool
 	SrcRegion *string
@@ -367,11 +359,11 @@ type copier struct {
 
 func (c copier) getContentLength() error {
 	var size int64
-	size = int64(c.in.Source.Size())
+	size = int64(c.in.Size)
 	// If less than 1 we want to double check, because unset == 0. We can make
 	// it a pointer and check for nil later.
 	if size <= 0 {
-		info, err := c.objectInfo(c.in.Source)
+		info, err := c.objectInfo()
 		if err != nil {
 			return err
 		}
@@ -398,15 +390,24 @@ func (c copier) init() error {
 	// Set up a source region. This is to get the source size if it isn't
 	// explicitly provided and for deleting the original source if the option
 	// is set.
-	if c.in.SrcRegion != nil && *c.in.SrcRegion != "" {
+	n := strings.SplitN(*c.in.CopySource, "/", 2)
+	if len(n) != 2 {
+		return fmt.Errorf("invalid CopySource, got %q wanted %q", *c.in.CopySource, "bucket/key")
+	}
+	srcBucket := n[0]
+	srcRegion, err := c.getBucketLocation(srcBucket)
+	if err != nil {
+		return err
+	}
+	if srcRegion != *c.in.Region {
 		srcSess := session.Must(session.NewSession(
 			&aws.Config{Region: c.in.SrcRegion}))
-		c.cfg.SrcS2 = s3.New(srcSess)
+		c.cfg.SrcS3 = s3.New(srcSess)
 	} else {
-		c.cfg.SrcS2 = c.cfg.S3
+		c.cfg.SrcS3 = c.cfg.S3
 	}
 
-	err := c.getContentLength()
+	err = c.getContentLength()
 	if err != nil {
 		msg := fmt.Sprintf("failed to get content length: %s", err.Error())
 		return awserr.New("RequestError", msg, nil)
@@ -417,6 +418,9 @@ func (c copier) init() error {
 // copy is the internal implementation of Copy.
 func (c copier) copy() error {
 	err := c.init()
+	if err != nil {
+		return err
+	}
 
 	// If there's a request to delete the source copy, do it on exit if there
 	// was no error copying.
@@ -425,7 +429,7 @@ func (c copier) copy() error {
 			if c.err != nil {
 				return
 			}
-			c.deleteObject(c.in.Source)
+			c.deleteObject()
 		}()
 	}
 
@@ -436,7 +440,7 @@ func (c copier) copy() error {
 	}
 
 	// Otherwise do a multipart copy.
-	uid, err := c.startMulipart(c.in.Dest)
+	uid, err := c.startMulipart()
 	if err != nil {
 		return err
 	}
@@ -458,9 +462,9 @@ func (c copier) copy() error {
 			}
 			mci := multipartCopyInput{
 				Part:            partNum + 1,
-				Bucket:          c.in.Dest.Bucket(),
-				Key:             c.in.Dest.Key(),
-				CopySource:      c.in.Source.CopySourceString(),
+				Bucket:          c.in.Bucket,
+				Key:             c.in.Key,
+				CopySource:      c.in.CopySource,
 				CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", offset, endByte)),
 				UploadID:        uid,
 			}
@@ -487,18 +491,18 @@ func (c copier) copy() error {
 
 func (c copier) copyObject() error {
 	coi := &s3.CopyObjectInput{
-		Bucket:     c.in.Dest.Bucket(),
-		Key:        c.in.Dest.Key(),
-		CopySource: c.in.Source.CopySourceString(),
+		Bucket:     c.in.Bucket,
+		Key:        c.in.Key,
+		CopySource: c.in.CopySource,
 	}
 	_, err := c.cfg.S3.CopyObject(coi)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
 			logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
-				"Failed to get source info for %s: %s\n", c.in.Source, aerr.Error()))
+				"Failed to get source info for %s: %s\n", *c.in.CopySource, aerr.Error()))
 		} else {
 			logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
-				"Failed to get source info for %s: %s\n", c.in.Source, err))
+				"Failed to get source info for %s: %s\n", *c.in.CopySource, err))
 		}
 		return err
 	}
@@ -594,8 +598,8 @@ func (c copier) copyPart() {
 // complete finishes this multipart copy.
 func (c copier) complete(uid *string) error {
 	cmui := &s3.CompleteMultipartUploadInput{
-		Bucket:   c.in.Dest.Bucket(),
-		Key:      c.in.Dest.Key(),
+		Bucket:   c.in.Bucket,
+		Key:      c.in.Key,
 		UploadId: uid,
 		MultipartUpload: &s3.CompletedMultipartUpload{
 			Parts: c.parts,
@@ -604,7 +608,7 @@ func (c copier) complete(uid *string) error {
 	_, err := c.cfg.S3.CompleteMultipartUpload(cmui)
 	if err != nil {
 		logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
-			"Failed to complete copy for %s: %s\n", *c.in.Source.CopySourceString(), err))
+			"Failed to complete copy for %s: %s\n", *c.in.CopySource, err))
 		return err
 	}
 	return nil
@@ -625,10 +629,10 @@ type multipartCopyInput struct {
 	UploadID        *string
 }
 
-func (c copier) startMulipart(o object) (*string, error) {
+func (c copier) startMulipart() (*string, error) {
 	cmui := &s3.CreateMultipartUploadInput{
-		Bucket: c.in.Dest.Bucket(),
-		Key:    c.in.Dest.Key(),
+		Bucket: c.in.Bucket,
+		Key:    c.in.Key,
 	}
 	resp, err := c.cfg.S3.CreateMultipartUpload(cmui)
 	if err != nil {
@@ -637,18 +641,18 @@ func (c copier) startMulipart(o object) (*string, error) {
 	return resp.UploadId, nil
 }
 
-func (c copier) objectInfo(o object) (*s3.HeadObjectOutput, error) {
+func (c copier) objectInfo() (*s3.HeadObjectOutput, error) {
 	info, err := c.cfg.SrcS3.HeadObject(&s3.HeadObjectInput{
-		Bucket: c.in.Source.Bucket(),
-		Key:    c.in.Source.Key(),
+		Bucket: c.in.Bucket,
+		Key:    c.in.Key,
 	})
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
 			logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
-				"Failed to get source object info for %s: %s\n", c.in.Source, aerr.Error()))
+				"Failed to get source object info for %s: %s\n", *c.in.CopySource, aerr.Error()))
 		} else {
 			logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
-				"Failed to get source object info for %s: %s\n", c.in.Source, err))
+				"Failed to get source object info for %s: %s\n", *c.in.CopySource, err))
 		}
 		return nil, err
 	}
@@ -656,20 +660,32 @@ func (c copier) objectInfo(o object) (*s3.HeadObjectOutput, error) {
 }
 
 // deleteObject deletes and object. We can use it after copy, say for a move.
-func (c *copier) deleteObject(o object) {
+func (c *copier) deleteObject() {
+	if c.in.CopySource == nil {
+		logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprint(
+			"CopySource must not me nil"))
+		return
+	}
+	n := strings.SplitN(*c.in.CopySource, "/", 2)
+	if len(n) != 2 {
+		logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
+			"invalid copy source, got %q but wanted %q", *c.in.CopySource, "bucket/key"))
+		return
+	}
+
 	params := &s3.DeleteObjectInput{
-		Bucket: o.Bucket(),
-		Key:    o.Key(),
+		Bucket: aws.String(n[0]),
+		Key:    aws.String(n[1]),
 	}
 	_, err := c.cfg.SrcS3.DeleteObject(params)
 	if err != nil {
 		logMessage(c.cfg.S3, aws.LogDebug, fmt.Sprintf(
-			"Failed to delete %s: %s", o, err))
+			"Failed to delete %s: %s", *c.in.CopySource, err))
 	}
 }
 
 func (c *copier) getBucketLocation(bucket string) (string, error) {
-	region, err := s3manager.GetBucketRegion(c.ctx, sess, bucket, "us-west-2")
+	region, err := GetBucketRegion(c.ctx, c.cfg.ConfigProvider, bucket, *c.in.Region)
 	if err != nil {
 		return "", err
 	}
